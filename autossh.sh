@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AutoSSH (Linux target) - give AI agents SSH access to this machine.
+# AutoSSH (Linux / macOS target) - give AI agents SSH access to this machine.
 #
 # Creates/uses an agent account, authorises a key, and prints a bundle you paste
 # to an agent so it can install the key + ssh config and start using the host.
@@ -9,6 +9,7 @@
 #
 # The bundle goes to stdout and everything else to stderr, so
 # `sudo bash autossh.sh > cerebro.md` saves just the bundle.
+# Keep it working on bash 3.2 (macOS's /bin/bash): no ${x,,}, no heredocs inside $(...).
 set -euo pipefail
 shopt -u patsub_replacement 2>/dev/null || true
 
@@ -52,7 +53,7 @@ ask() {
 # yesno "question" default(y|n) -> 0 for yes
 yesno() {
   local a; ask a "$1 [$( [[ $2 == y ]] && echo Y/n || echo y/N )]" ''
-  a=${a:-$2}; [[ ${a,,} == y* ]]
+  a=${a:-$2}; [[ $a == [yY]* ]]
 }
 
 parse_args() {
@@ -75,21 +76,49 @@ parse_args() {
 }
 
 detect_platform() {
-  [[ $(uname -s) == Linux ]] || die "This is the Linux script. On Windows run autossh.ps1."
+  OS=$(uname -s)
+  [[ $OS == Linux || $OS == Darwin ]] || die "This is the Linux / macOS script. On Windows run autossh.ps1."
   [[ $EUID -eq 0 ]] || die "Run as root, e.g.  curl -fsSL <url>/autossh.sh | sudo bash"
   OS_NAME=Linux
-  if [[ -r /etc/os-release ]]; then OS_NAME=$(. /etc/os-release; echo "${PRETTY_NAME:-$NAME}"); fi
+  if [[ $OS == Darwin ]]; then OS_NAME="macOS $(sw_vers -productVersion 2>/dev/null || true)"
+  elif [[ -r /etc/os-release ]]; then OS_NAME=$(. /etc/os-release; echo "${PRETTY_NAME:-$NAME}"); fi
   OS_NAME=$(printf '%s' "$OS_NAME" | tr -d '"$`\\')
   ARCH=$(uname -m)
-  MACHINE=$(hostname 2>/dev/null || uname -n); MACHINE=$(slug "${MACHINE%%.*}")
+  MACHINE=$(scutil --get LocalHostName 2>/dev/null || hostname 2>/dev/null || uname -n); MACHINE=$(slug "${MACHINE%%.*}")
   PM=''
   for p in apt-get dnf yum zypper pacman apk; do
     if command -v "$p" >/dev/null 2>&1; then PM=$p; break; fi
   done
   INIT=none
-  if [[ -d /run/systemd/system ]]; then INIT=systemd
+  if [[ $OS == Darwin ]]; then INIT=launchd
+  elif [[ -d /run/systemd/system ]]; then INIT=systemd
   elif command -v rc-service >/dev/null 2>&1; then INIT=openrc; fi
 }
+
+# macOS keeps accounts in Directory Services, not /etc/passwd or /etc/group, and has no getent.
+# passwd_field USER home|shell
+passwd_field() {
+  if [[ $OS == Darwin ]]; then
+    local k=NFSHomeDirectory; [[ $2 == shell ]] && k=UserShell
+    dscl . -read "/Users/$1" "$k" 2>/dev/null | sed -n "s/^$k: //p; s/^ //p"
+  else
+    local f=6; [[ $2 == shell ]] && f=7
+    (getent passwd "$1" 2>/dev/null || grep "^$1:" /etc/passwd) | cut -d: -f"$f"
+  fi
+}
+
+group_exists() {
+  if [[ $OS == Darwin ]]; then dscl . -read "/Groups/$1" >/dev/null 2>&1; else grep -q "^$1:" /etc/group; fi
+}
+
+# add_to_group USER GROUP
+add_to_group() {
+  if [[ $OS == Darwin ]]; then dseditgroup -o edit -a "$1" -t user "$2"
+  elif command -v usermod >/dev/null 2>&1; then usermod -aG "$2" "$1"
+  else addgroup "$1" "$2"; fi
+}
+
+remote_login_on() { launchctl print system/com.openssh.sshd >/dev/null 2>&1; }
 
 pkg_install() {
   info "Installing $*"
@@ -211,10 +240,20 @@ ensure_sshd() {
     case $PM in apk) pkg_install openssh-keygen ;; apt-get) pkg_install openssh-client ;; *) pkg_install openssh-clients ;; esac
   fi
   if ! command -v git >/dev/null 2>&1 && [[ -n $PM ]]; then pkg_install git || warn "Couldn't install git."; fi
-  mkdir -p /run/sshd && chmod 755 /run/sshd   # privsep dir; sshd -t/-T refuse to run without it
+  if [[ $OS == Linux ]]; then mkdir -p /run/sshd && chmod 755 /run/sshd; fi   # privsep dir; sshd -t/-T refuse to run without it
   ssh-keygen -A >/dev/null 2>&1 || true
 
   case $INIT in
+    launchd)
+      # Remote Login. systemsetup needs Full Disk Access on newer macOS, so fall back to launchctl.
+      if ! remote_login_on; then
+        info "Turning on Remote Login (sshd)"
+        systemsetup -setremotelogin on </dev/null >/dev/null 2>&1 || true
+        remote_login_on || launchctl load -w /System/Library/LaunchDaemons/ssh.plist >/dev/null 2>&1 || true
+        remote_login_on || die "Couldn't turn on Remote Login - switch it on in System Settings > General > Sharing, then re-run."
+      fi
+      warn "Over SSH, macOS blocks Desktop, Documents, Downloads etc. unless Remote Login's"
+      warn "'Allow full disk access for remote users' is on (System Settings > General > Sharing)." ;;
     systemd)
       SVC=sshd
       if [[ -n $(systemctl list-unit-files ssh.service --no-legend 2>/dev/null || true) ]]; then SVC=ssh; fi
@@ -236,13 +275,27 @@ ensure_sshd() {
 ensure_user() {
   if [[ $SSH_USER != root ]] && ! id -u "$SSH_USER" >/dev/null 2>&1; then
     info "Creating user $SSH_USER"
-    local sh; sh=$(command -v bash)
-    if command -v useradd >/dev/null 2>&1; then useradd -m -s "$sh" -c "AutoSSH agent account" "$SSH_USER"
-    else adduser -D -s "$sh" -g "AutoSSH agent account" "$SSH_USER"; fi
-    # No password, but not "locked" either: a leading '!' blocks key logins when sshd has UsePAM no.
-    sed -i "s/^$SSH_USER:![^:]*:/$SSH_USER:*:/" /etc/shadow
+    if [[ $OS == Darwin ]]; then
+      # Next free UID from 501, where macOS starts regular accounts. Password '*' means no password
+      # login, but keys still work. IsHidden keeps it off the login window and Users & Groups.
+      local uid kv
+      uid=$(dscl . -list /Users UniqueID | awk 'BEGIN {m = 500} $2 > m && $2 < 60000 {m = $2} END {print m + 1}')
+      dscl . -create "/Users/$SSH_USER"
+      for kv in "UniqueID $uid" "PrimaryGroupID 20" "UserShell /bin/bash" "RealName AutoSSH agent account" \
+                "NFSHomeDirectory /Users/$SSH_USER" "Password *" "IsHidden 1"; do
+        dscl . -create "/Users/$SSH_USER" "${kv%% *}" "${kv#* }"
+      done
+      createhomedir -c -u "$SSH_USER" >/dev/null 2>&1 || true
+      if [[ ! -d /Users/$SSH_USER ]]; then mkdir -p "/Users/$SSH_USER"; chown "$SSH_USER:staff" "/Users/$SSH_USER"; fi
+    else
+      local sh; sh=$(command -v bash)
+      if command -v useradd >/dev/null 2>&1; then useradd -m -s "$sh" -c "AutoSSH agent account" "$SSH_USER"
+      else adduser -D -s "$sh" -g "AutoSSH agent account" "$SSH_USER"; fi
+      # No password, but not "locked" either: a leading '!' blocks key logins when sshd has UsePAM no.
+      sed -i "s/^$SSH_USER:![^:]*:/$SSH_USER:*:/" /etc/shadow
+    fi
   fi
-  USER_HOME=$( (getent passwd "$SSH_USER" 2>/dev/null || grep "^$SSH_USER:" /etc/passwd) | cut -d: -f6)
+  USER_HOME=$(passwd_field "$SSH_USER" home)
   USER_GROUP=$(id -gn "$SSH_USER")
   [[ -d $USER_HOME ]] || die "Home directory for $SSH_USER not found."
 
@@ -254,15 +307,15 @@ ensure_user() {
       printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$SSH_USER" >"$f.tmp"; chmod 440 "$f.tmp"
       visudo -cf "$f.tmp" >/dev/null || { rm -f "$f.tmp"; die "sudoers rule failed validation."; }
       mv "$f.tmp" "$f"
-      if ! grep -Eq '^[#@]includedir[[:space:]]+/etc/sudoers.d' /etc/sudoers; then
+      if ! grep -Eq '^[#@]includedir[[:space:]]+(/private)?/etc/sudoers.d' /etc/sudoers; then
         cp -p /etc/sudoers /etc/sudoers.autossh.bak
         echo '@includedir /etc/sudoers.d' >>/etc/sudoers
         visudo -c >/dev/null || { cp -p /etc/sudoers.autossh.bak /etc/sudoers; die "Couldn't enable /etc/sudoers.d."; }
       fi
       EXTRA="passwordless sudo"
     fi
-    if grep -q '^docker:' /etc/group && ! id -nG "$SSH_USER" | tr ' ' '\n' | grep -qx docker; then
-      if command -v usermod >/dev/null 2>&1; then usermod -aG docker "$SSH_USER"; else addgroup "$SSH_USER" docker; fi
+    if group_exists docker && ! id -nG "$SSH_USER" | tr ' ' '\n' | grep -qx docker; then
+      add_to_group "$SSH_USER" docker
       EXTRA+="${EXTRA:+, }docker group"
     fi
   fi
@@ -291,15 +344,21 @@ check_sshd_access() {
   groups=$(effective allowgroups)
   if [[ -n $groups ]] && ! id -nG "$SSH_USER" | tr ' ' '\n' | grep -qxF -f <(tr ' ' '\n' <<<"$groups"); then
     local g=${groups%% *}
-    if grep -q "^$g:" /etc/group; then
+    if group_exists "$g"; then
       info "Adding $SSH_USER to '$g' (sshd AllowGroups)"
-      if command -v usermod >/dev/null 2>&1; then usermod -aG "$g" "$SSH_USER"; else addgroup "$SSH_USER" "$g"; fi
+      add_to_group "$SSH_USER" "$g"
     else warn "sshd AllowGroups ($groups) may block $SSH_USER - check /etc/ssh/sshd_config."; fi
   fi
   if tr ' ' '\n' <<<"$(effective denyusers)" | grep -qx "$SSH_USER"; then
     warn "sshd DenyUsers lists $SSH_USER - remove it from /etc/ssh/sshd_config."
   fi
   [[ $(effective pubkeyauthentication) == no ]] && warn "sshd has PubkeyAuthentication no - key logins will fail."
+  # Remote Login set to "Only these users" is enforced through this group.
+  if [[ $OS == Darwin ]] && group_exists com.apple.access_ssh \
+     && ! dseditgroup -o checkmember -m "$SSH_USER" com.apple.access_ssh >/dev/null 2>&1; then
+    info "Adding $SSH_USER to Remote Login's allowed users"
+    add_to_group "$SSH_USER" com.apple.access_ssh
+  fi
   if [[ $SSH_USER == root ]]; then
     prl=$(effective permitrootlogin)
     if [[ $prl == no || $prl == forced-commands-only ]]; then sshd_prepend "PermitRootLogin prohibit-password"; fi
@@ -308,6 +367,7 @@ check_sshd_access() {
     case $INIT in
       systemd) systemctl reload "$SVC" 2>/dev/null || systemctl restart "$SVC" ;;
       openrc)  rc-service sshd reload >/dev/null 2>&1 || rc-service sshd restart >/dev/null ;;
+      launchd) ;;   # launchd starts sshd per connection, so the next login reads the new config
       none)    kill -HUP "$(cat /run/sshd.pid 2>/dev/null || cat /var/run/sshd.pid)" 2>/dev/null || warn "Restart sshd to apply the change." ;;
     esac
   fi
@@ -358,7 +418,8 @@ host_keys() {
 
 lan_ip() {
   { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
-    hostname -I 2>/dev/null | awk '{print $1}'; } | grep -m1 . || true
+    hostname -I 2>/dev/null | awk '{print $1}'
+    ipconfig getifaddr "$(route -n get default 2>/dev/null | awk '$1=="interface:"{print $2; exit}')" 2>/dev/null; } | grep -m1 . || true
 }
 
 print_cloudflare() {
@@ -400,7 +461,7 @@ render_bundle() {
     via="direct"
     local p=${PORT:-$SSHD_PORT}; [[ $p != 22 ]] && portline="  Port $p"
   fi
-  shell_desc=$(basename "$( (getent passwd "$SSH_USER" 2>/dev/null || grep "^$SSH_USER:" /etc/passwd) | cut -d: -f7)")
+  shell_desc=$(basename "$(passwd_field "$SSH_USER" shell)")
   if [[ $SSH_USER == root ]]; then sudo_desc="root"; else sudo_desc=${EXTRA:-no sudo}; fi
 
   CONF="# autossh: alias=$ALIAS os=\"$OS_NAME\" arch=$ARCH user=$SSH_USER access=\"$sudo_desc\" shell=$shell_desc via=$via added=$today
@@ -424,6 +485,7 @@ Host $ALIAS
   if [[ $MODE == tunnel ]]; then addr_desc="\`$HOST\` via Cloudflare Tunnel (\`cloudflared\` is installed by the block below if missing)"
   else addr_desc="\`$HOST${PORT:+:$PORT}\` (direct SSH)"; fi
   note="**SSH host \`$ALIAS\`** - $OS_NAME, remote shell $shell_desc, user \`$SSH_USER\` ($sudo_desc). Run commands with \`ssh $ALIAS '<command>'\` (config: ~/.ssh/autossh/$ALIAS.conf). Use it to pull, build, redeploy and inspect sites/services on this machine. Work non-interactively, check \`git status\` before pulling, verify deploys (e.g. curl the site) and confirm with the user before destructive or irreversible actions (deleting data, dropping databases, rebooting)."
+  if [[ $OS == Darwin ]]; then note+=" It's a Mac: \`ssh $ALIAS '<command>'\` gets a minimal PATH, so call Homebrew tools by full path (/opt/homebrew/bin or /usr/local/bin)."; fi
 
   local cf_sh='' cf_ps=''
   if [[ $MODE == tunnel ]]; then
@@ -446,8 +508,9 @@ if (-not (Test-Path $cf)) { throw "Install cloudflared (winget install Cloudflar
     cf_ps='$cf = "unused"'
   fi
 
+  # read -d '', not t=$(cat <<...): bash 3.2 can't parse unbalanced ( or ' in a heredoc inside $(...).
   local t
-  t=$(cat <<'TEMPLATE'
+  IFS= read -r -d '' t <<'TEMPLATE' || true
 <!-- AutoSSH bundle - contains a private key. Treat this whole message as a secret. -->
 # SSH access: @@ALIAS@@
 
@@ -513,10 +576,9 @@ Claude Code with the `autossh` skill installed finds hosts in ~/.ssh/autossh aut
 
 > @@NOTE@@
 TEMPLATE
-)
   if [[ -z $PRIVKEY ]]; then
     # --pubkey mode: the agent already holds the private key; give it just the pin + note.
-    t=$(cat <<'TEMPLATE'
+    IFS= read -r -d '' t <<'TEMPLATE' || true
 # AutoSSH: @@ALIAS@@ is ready
 
 Your key (@@FP@@) is authorised for `@@USER@@` on @@OS@@. To pin this machine's host key, write
@@ -530,8 +592,8 @@ Then run `ssh @@ALIAS@@ whoami` (or `/autossh test @@ALIAS@@`). Capability note 
 
 > @@NOTE@@
 TEMPLATE
-)
   fi
+  t=${t%$'\n'}
   t=${t//@@PRIVKEY@@/$PRIVKEY}; t=${t//@@KNOWN@@/$KNOWN}; t=${t//@@CONF@@/$CONF}
   t=${t//@@CF_SH@@/$cf_sh};     t=${t//@@CF_PS@@/$cf_ps}; t=${t//@@NOTE@@/$note}
   t=${t//@@ADDR@@/$addr_desc};  t=${t//@@USER@@/$SSH_USER}; t=${t//@@SUDO@@/$sudo_desc}

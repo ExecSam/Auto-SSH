@@ -41,7 +41,7 @@ function YesNo($q, $def = $true) {
 }
 
 # --- Platform -----------------------------------------------------------------
-if ($env:OS -ne 'Windows_NT') { throw 'This is the Windows script. On Linux run autossh.sh.' }
+if ($env:OS -ne 'Windows_NT') { throw 'This is the Windows script. On Linux or macOS run autossh.sh.' }
 $me = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run this from an elevated PowerShell (Run as administrator).'

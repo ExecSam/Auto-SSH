@@ -1,6 +1,6 @@
 ---
 name: autossh
-description: SSH access to the user's machines (servers, home lab, Windows boxes) for pulling code, redeploying sites, restarting services, reading logs and other remote work. Use whenever a task touches a remote machine or a deployment, or when the user runs /autossh (add | new | list | test | remove) or pastes an "AutoSSH bundle".
+description: SSH access to the user's machines (servers, home lab, Macs, Windows boxes) for pulling code, redeploying sites, restarting services, reading logs and other remote work. Use whenever a task touches a remote machine or a deployment, or when the user runs /autossh (add | new | list | test | remove) or pastes an "AutoSSH bundle".
 ---
 
 # AutoSSH
@@ -20,10 +20,11 @@ That needs `cloudflared` installed locally, but nothing else.
 
 - **Find hosts:** `grep -h '^# autossh:' ~/.ssh/autossh/*.conf`. In PowerShell use `Get-Content ~/.ssh/autossh/*.conf | Select-String '^# autossh:'`.
 - **Run commands:** use `ssh <alias> '<command>'`. The config already sets the key, user, proxy, `BatchMode` and a pinned host key. Never add `-o StrictHostKeyChecking=no` or similar. A host key mismatch is a real problem to report, not to bypass.
-- **Linux hosts:** the shell is bash and `sudo` needs no password. For multi-line work use `ssh <alias> 'bash -s' <<'EOF' ... EOF`.
+- **Linux and macOS hosts:** the shell is bash and `sudo` needs no password. For multi-line work use `ssh <alias> 'bash -s' <<'EOF' ... EOF`.
+- **macOS hosts:** `ssh <alias> '<command>'` gets a minimal PATH, so call Homebrew tools by full path (`/opt/homebrew/bin` or `/usr/local/bin`).
 - **Windows hosts:** commands run in PowerShell, so use Windows paths and separate statements with `;`. For anything long, `scp` a `.ps1` over and run it.
 - **Files:** use `scp file <alias>:path`, or `rsync -az -e ssh dir/ <alias>:path/` where rsync exists on both ends.
-- **Long-running processes** belong under systemd, docker or `nohup`, never in an open SSH session.
+- **Long-running processes** belong under systemd (launchd on macOS), docker or `nohup`, never in an open SSH session.
 - **Deploying a site:**
   1. Look first: `git status`, `git log -1`, and how the site actually runs (systemd unit, docker compose, pm2, IIS).
   2. Pull, build and restart.
@@ -86,7 +87,7 @@ Enrol a machine *agent-first*: the key is generated here and the private key nev
    ```
 4. **Add the include line.** Make sure `~/.ssh/config` starts with `Include autossh/*.conf`. Prepend it if it's missing, and keep the rest of the file untouched.
 5. **Give the user the command to run on the target.** Fill in the public key from `<alias>.key.pub`. Add `--tunnel` / `-Tunnel` for tunnel hosts and `--direct` / `-Direct` for direct ones.
-   - Linux target:
+   - Linux or macOS target:
      ```
      curl -fsSL https://raw.githubusercontent.com/ExecSam/Auto-SSH/main/autossh.sh | sudo bash -s -- --address <hostname> --alias <alias> --tunnel --pubkey '<public key line>'
      ```
@@ -105,7 +106,7 @@ Print one line per host from the metadata lines: alias, OS, user, via, added.
 
 Leave out the alias to test every host. For each one:
 1. Run `ssh <alias> whoami`.
-2. If the metadata says `os=unknown`, look the OS up and rewrite the metadata line. On Linux run `ssh <alias> '. /etc/os-release; echo "$PRETTY_NAME|$(uname -m)|$SHELL"'`. On Windows run `ssh <alias> '(Get-CimInstance Win32_OperatingSystem).Caption'`.
+2. If the metadata says `os=unknown`, look the OS up and rewrite the metadata line. On Linux run `ssh <alias> '. /etc/os-release; echo "$PRETTY_NAME|$(uname -m)|$SHELL"'`. On macOS (`ssh <alias> uname -s` prints `Darwin`) run `ssh <alias> 'echo "macOS $(sw_vers -productVersion)|$(uname -m)|$SHELL"'`. On Windows run `ssh <alias> '(Get-CimInstance Win32_OperatingSystem).Caption'`.
 3. Read failures from `ssh -v <alias> whoami`:
    - `websocket: bad handshake` or `dial tcp` means a Cloudflare route or DNS problem.
    - `Permission denied (publickey)` means the key isn't authorised on the target.
@@ -115,4 +116,4 @@ Leave out the alias to test every host. For each one:
 
 1. Delete `~/.ssh/autossh/<alias>.*`.
 2. Tell the user to revoke the key on the target: delete the `authorized_keys` line ending in `autossh:<alias>:...`. On Windows that line is in `C:\ProgramData\ssh\administrators_authorized_keys`.
-3. To drop the account entirely: `sudo userdel -r claude` on Linux, `Remove-LocalUser claude` on Windows.
+3. To drop the account entirely: `sudo userdel -r claude` on Linux, `sudo dscl . -delete /Users/claude && sudo rm -rf /Users/claude` on macOS, `Remove-LocalUser claude` on Windows.

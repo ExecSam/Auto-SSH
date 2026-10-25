@@ -17,7 +17,7 @@ autossh.sh / autossh.ps1                pastes the bundle's install block
 
 ## Quick start
 
-**Linux target**, as root or with sudo:
+**Linux or macOS target**, as root or with sudo (on a Mac, from Terminal as an admin user):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ExecSam/Auto-SSH/main/autossh.sh | sudo bash
@@ -34,7 +34,7 @@ The script asks for the SSH address first and changes nothing until you confirm 
 1. **Add the Cloudflare route it prints** in Zero Trust: Networks > Tunnels > *tunnel* > Published application routes. It looks like `ssh-cerebro.rifts.cc` > SSH > `localhost:22`.
 2. **Paste the bundle to your agent.** The bundle contains the private key, so treat it like a password. It is the only copy. If you lose it, re-run the script, which rotates the key.
 
-To save just the bundle on Linux, redirect it: `... | sudo bash > cerebro.md`. All other output goes to stderr.
+To save just the bundle on Linux or macOS, redirect it: `... | sudo bash > cerebro.md`. All other output goes to stderr.
 
 ## Addresses and Cloudflare Tunnels
 
@@ -81,11 +81,11 @@ extra memory edits.
 
 ## Options
 
-| Linux (`autossh.sh`) | Windows (`autossh.ps1`) | |
+| Linux / macOS (`autossh.sh`) | Windows (`autossh.ps1`) | |
 |---|---|---|
 | `-a, --address` | `-Address` | Tunnel hostname, or `host[:port]` with `--direct` |
 | `--alias` | `-Alias` | Name agents use (`ssh <alias>`). Defaults to the address. |
-| `-u, --user` | `-User` | Account agents use. Default `claude`. `root` is allowed on Linux. |
+| `-u, --user` | `-User` | Account agents use. Default `claude`. `root` is allowed on Linux and macOS. |
 | `--direct` / `--tunnel` | `-Direct` / `-Tunnel` | Force the connection mode. Otherwise it's inferred or asked. |
 | `--pubkey 'KEY'` | `-PubKey 'KEY'` | Authorise an agent's existing key instead of generating one |
 | `--token-id`, `--token-secret` | `-TokenId`, `-TokenSecret` | Cloudflare Access service token |
@@ -101,6 +101,12 @@ Re-running is safe. It replaces only the key with the same tag (`autossh:<alias>
 - Creates `claude` with no password. Key login only.
 - Adds `/etc/sudoers.d/autossh-claude` (NOPASSWD) and adds `claude` to the `docker` group if that group exists.
 - Edits `sshd_config` only when it would otherwise block the login: an existing `AllowUsers` list, or `PermitRootLogin no` when you chose root. It backs up the file first and validates with `sshd -t`.
+
+**macOS:**
+- Turns on Remote Login (sshd) if it's off. If Remote Login only allows some users, it adds `claude` to them.
+- Creates `claude` with no password (key login only) and `/bin/bash` as its shell, hidden from the login window and Users & Groups.
+- Adds `/etc/sudoers.d/autossh-claude` (NOPASSWD) and edits `sshd_config` by the same rules as Linux.
+- macOS keeps Desktop, Documents and Downloads off-limits to SSH sessions unless *Allow full disk access for remote users* is on, under System Settings > General > Sharing > Remote Login.
 
 **Windows:**
 - Installs OpenSSH Server if it's missing, and sets `sshd` to start automatically.
@@ -125,5 +131,6 @@ earn its keep for shell-less clients such as Claude Desktop chat.
 ## Revoking access
 
 On the target, delete the `authorized_keys` line ending in `autossh:<alias>:...`. To remove the
-account entirely, run `sudo userdel -r claude` on Linux or `Remove-LocalUser claude` on Windows.
+account entirely, run `sudo userdel -r claude` on Linux, `sudo dscl . -delete /Users/claude && sudo rm -rf /Users/claude`
+on macOS, or `Remove-LocalUser claude` on Windows.
 On the agent, run `/autossh remove <alias>` or delete `~/.ssh/autossh/<alias>.*`.
